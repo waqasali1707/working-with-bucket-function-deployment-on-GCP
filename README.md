@@ -1,84 +1,158 @@
-# Project Name
+# Video Processing API
 
 ## Overview
 
-This project processes videos using a Cloud Function. It supports both direct GCS access and signed URLs.
+This project is a FastAPI-based video processing service deployed on Google Cloud Functions Gen2. It processes videos to find specific phrases and splits them at the detected timestamp. The service uses Deepgram for transcription (directly from URL) and GPT-4 for intelligent phrase detection.
+
+## Features
+
+- **Asynchronous Processing**: Submit jobs and check status later
+- **Direct URL Transcription**: Deepgram transcribes directly from signed URLs (no download needed)
+- **Intelligent Phrase Detection**: Uses GPT-4 with fallback to simple search
+- **Chunked Processing**: Optional transcript chunking for large videos
+- **Automatic Video Splitting**: Splits videos into public/private parts at detected timestamp
+
+## API Endpoints
+
+### 1. Submit Video Processing Job
+```
+POST /process-video
+```
+
+Request body:
+```json
+{
+  "bucket_name": "postscrypt",
+  "video_path": "3/video1.mp4",
+  "signed_url": "https://...",
+  "target_phrase": "I quite enjoyed under the dome.",
+  "num_chunks": 5,
+  "job_id": "custom-job-id"  // Optional
+}
+```
+
+Response:
+```json
+{
+  "job_id": "uuid-here",
+  "status": "accepted",
+  "message": "Video processing job started"
+}
+```
+
+### 2. Get Video Paths
+```
+GET /video-paths/{job_id}
+```
+
+Response (when completed):
+```json
+{
+  "job_id": "uuid-here",
+  "status": "completed",
+  "public_video_path": "gs://postscrypt/3/public/video1.mp4",
+  "private_video_path": "gs://postscrypt/3/private/video1.mp4",
+  "processing_details": {
+    "utterances_found": 150,
+    "transcript_preview": "..."
+  }
+}
+```
+
+## Video Path Structure
+
+For a video at `bucket/3/video1.mp4`, the split videos will be saved as:
+- **Public part**: `bucket/3/public/video1.mp4` (before the target phrase)
+- **Private part**: `bucket/3/private/video1.mp4` (after the target phrase)
 
 ## Setup
 
-1. **Environment Variables**: Set the following environment variables to configure the application:
-   - `CLOUD_FUNCTION_URL`: The URL of the Cloud Function.
-   - `SIGNED_URL`: The signed URL for accessing video files.
+1. **Environment Variables**: Set the following environment variables:
+   - `DEEPGRAM_API_KEY`: Your Deepgram API key
+   - `OPENAI_API_KEY`: Your OpenAI API key
+   - `BUCKET_NAME`: Default GCS bucket name
+   - `SERVICE_URL`: The Cloud Run service URL (for testing)
+   - `SIGNED_URL`: A signed URL for testing
 
 2. **Installation**:
-   - Install the required packages using `pip install -r requirements.txt`.
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-3. **Running Tests**:
-   - Run the tests using `python test_function.py` and choose the desired test method.
+3. **Local Development**:
+   ```bash
+   uvicorn main:app --reload --port 8080
+   ```
 
 ## Deployment
 
-- Use the `deploy_script.sh` to deploy the application.
+Deploy to Google Cloud Functions Gen2 using the provided script:
 
-## Viewing Cloud Function URL
+```bash
+# Set environment variables first
+export DEEPGRAM_API_KEY="your-key"
+export OPENAI_API_KEY="your-key"
+export BUCKET_NAME="your-bucket"
 
-- After deploying the Cloud Function using the `deploy_script.sh`, the function URL can be viewed in the terminal output. Look for the line that starts with `Function URL:`.
+# Deploy
+./deploy_script.sh
+```
 
-## Generating a Signed URL for a GCP Bucket
+The deployment script:
+- Uses Google Cloud Functions Gen2 (source-based deployment, no Docker required)
+- Allocates 8GB memory and 2 CPUs
+- Sets a 9-minute timeout
+- Configures auto-scaling (0-100 instances)
+- Automatically handles FFmpeg installation
 
-To generate a signed URL for a Google Cloud Storage bucket, follow these steps:
+## Testing
 
-1. **Install the Google Cloud SDK**: Ensure you have the Google Cloud SDK installed and authenticated.
+Run the test suite:
 
-2. **Use the `gsutil` command**:
-   - Run the following command to generate a signed URL:
-     ```bash
-     gsutil signurl -d [DURATION] -u [SERVICE_ACCOUNT_JSON] gs://[BUCKET_NAME]/[OBJECT_NAME]
-     ```
-   - Replace `[DURATION]` with the duration the signed URL should be valid (e.g., `1h` for one hour).
-   - Replace `[SERVICE_ACCOUNT_JSON]` with the path to your service account JSON key file.
-   - Replace `[BUCKET_NAME]` and `[OBJECT_NAME]` with your bucket and object names.
+```bash
+# Set the service URL
+export SERVICE_URL="https://your-service-url.run.app"
+export SIGNED_URL="your-signed-url"
 
-3. **Example**:
-   ```bash
-   gsutil signurl -d 1h -u my-service-account.json gs://my-bucket/my-object
-   ```
+# Run tests
+python test_function.py
+```
 
-This will output a signed URL that can be used to access the specified object in the bucket.
+Test options:
+1. Full video processing test (submit and wait)
+2. Test with custom job ID
+3. Test invalid job ID handling
+4. Test API root endpoint
+5. Run all tests
 
-## Setting Environment Variables
+## Generating Signed URLs
 
-Before running the `deploy_script.sh`, ensure that the necessary environment variables are set. This can be done in the terminal or command prompt:
+To generate a signed URL for GCS:
 
-### On Windows:
+```bash
+gsutil signurl -d 1h service-account.json gs://bucket/path/to/video.mp4
+```
 
-1. Open Command Prompt or PowerShell.
-2. Set environment variables using the `set` command:
-   ```cmd
-   set DEEPGRAM_API_KEY=your-deepgram-api-key
-   set OPENAI_API_KEY=your-openai-api-key
-   set BUCKET_NAME=your-bucket-name
-   ```
+## Architecture
 
-### On Unix-based Systems (Linux/Mac):
+The service follows this workflow:
 
-1. Open Terminal.
-2. Set environment variables using the `export` command:
-   ```bash
-   export DEEPGRAM_API_KEY=your-deepgram-api-key
-   export OPENAI_API_KEY=your-openai-api-key
-   export BUCKET_NAME=your-bucket-name
-   ```
+1. **Job Submission**: Client submits video processing request
+2. **Background Processing**:
+   - Video downloaded from GCS for splitting
+   - Audio transcribed directly from signed URL by Deepgram
+   - GPT-4 finds the target phrase timestamp
+   - Video split at detected timestamp
+   - Parts uploaded to public/private folders
+3. **Status Checking**: Client polls for job completion
 
-## Prerequisites for Running `deploy_script.sh` on Windows
+## Notes
 
-- **Git Bash**: Install Git for Windows, which includes Git Bash, allowing you to run `.sh` scripts.
-- **Google Cloud SDK**: Ensure the Google Cloud SDK is installed and authenticated.
-
-## Additional Notes
-
-- Ensure you have the necessary permissions and roles in Google Cloud to deploy functions and access storage buckets.
-- Verify that your Google Cloud project is set correctly using `gcloud config set project [PROJECT_ID]`.
+- The service uses in-memory job storage (jobs are lost on restart)
+- For production, consider using a persistent storage solution
+- Signed URLs must be valid for the duration of processing
+- FFmpeg is automatically available in Cloud Functions Gen2 runtime
+- No Docker configuration needed - deployment is source-based
 
 ## License
 

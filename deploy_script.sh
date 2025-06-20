@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Cloud Function deployment script
+# Cloud Function Gen2 deployment script for FastAPI
 # Make sure you have gcloud CLI installed and authenticated
 
 # Function name and configuration
@@ -26,10 +26,10 @@ echo ""
 echo -e "${YELLOW}🔍 Checking for main.py...${NC}"
 if [ -f "main.py" ]; then
     echo -e "${GREEN}✅ main.py found${NC}"
-    if grep -q "def process_video_cloud" main.py; then
-        echo -e "${GREEN}✅ process_video_cloud function found in main.py${NC}"
+    if grep -q "app = FastAPI" main.py && grep -q "def main" main.py; then
+        echo -e "${GREEN}✅ FastAPI app and main function found in main.py${NC}"
     else
-        echo -e "${RED}❌ process_video_cloud function NOT found in main.py!${NC}"
+        echo -e "${RED}❌ FastAPI app or main function NOT found in main.py!${NC}"
         exit 1
     fi
 else
@@ -39,9 +39,9 @@ else
     # Check if there's another Python file that should be renamed
     PYTHON_FILES=(*.py)
     if [ ${#PYTHON_FILES[@]} -eq 1 ] && [ -f "${PYTHON_FILES[0]}" ]; then
-        echo -e "${YELLOW}Found ${PYTHON_FILES[0]} - checking if it contains the function...${NC}"
-        if grep -q "def process_video_cloud" "${PYTHON_FILES[0]}"; then
-            echo -e "${GREEN}✅ Found process_video_cloud in ${PYTHON_FILES[0]}${NC}"
+        echo -e "${YELLOW}Found ${PYTHON_FILES[0]} - checking if it contains FastAPI app...${NC}"
+        if grep -q "app = FastAPI" "${PYTHON_FILES[0]}"; then
+            echo -e "${GREEN}✅ Found FastAPI app in ${PYTHON_FILES[0]}${NC}"
             echo -e "${YELLOW}Copying ${PYTHON_FILES[0]} to main.py...${NC}"
             cp "${PYTHON_FILES[0]}" main.py
         fi
@@ -61,21 +61,13 @@ if [ ! -f "requirements.txt" ]; then
 fi
 
 echo ""
-echo -e "${YELLOW}🧹 Cleaning up previous deployment...${NC}"
-
-# Delete the existing function (if it exists)
-echo "Deleting existing function (if any)..."
-gcloud functions delete $FUNCTION_NAME --region=$REGION --quiet 2>/dev/null || echo "No existing function to delete"
+echo -e "${YELLOW}🧹 Preparing deployment...${NC}"
 
 # Clear local caches and old deployment files
 echo "Clearing local caches..."
 rm -rf __pycache__ 2>/dev/null
 rm -f .gcloudignore 2>/dev/null
 rm -f function-source.zip 2>/dev/null
-
-# Wait a moment for deletion to complete
-echo "Waiting for cleanup to complete..."
-sleep 5
 
 # Create a minimal .gcloudignore
 echo "Creating .gcloudignore file..."
@@ -104,6 +96,10 @@ Thumbs.db
 .git/
 .gitignore
 
+# Docker files (not needed for Functions)
+Dockerfile
+.dockerignore
+
 # Other scripts and test files
 test_*.py
 debug_*.py
@@ -122,21 +118,25 @@ README*
 EOF
 
 echo ""
-echo -e "${GREEN}🚀 Deploying function...${NC}"
+echo -e "${GREEN}🚀 Deploying FastAPI app to Cloud Functions Gen2...${NC}"
 echo -e "${CYAN}Using API keys:${NC}"
 echo "  DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:0:20}..."
 echo "  OPENAI_API_KEY: ${OPENAI_API_KEY:0:20}..."
 echo "  BUCKET_NAME: $BUCKET_NAME"
 
-# Deploy the function
+# Deploy using Cloud Functions Gen2
 gcloud functions deploy $FUNCTION_NAME \
+  --gen2 \
   --runtime python311 \
   --trigger-http \
   --allow-unauthenticated \
-  --entry-point process_video_cloud \
+  --entry-point main \
   --source . \
   --memory 8GB \
   --timeout 540s \
+  --cpu 2 \
+  --max-instances 100 \
+  --min-instances 0 \
   --set-env-vars "LOG_LEVEL=INFO,DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY},OPENAI_API_KEY=${OPENAI_API_KEY},BUCKET_NAME=${BUCKET_NAME}" \
   --region $REGION
 
@@ -156,13 +156,14 @@ fi
 # Show the function URL
 echo ""
 echo -e "${CYAN}Function URL:${NC}"
-gcloud functions describe $FUNCTION_NAME --region=$REGION --format="value(httpsTrigger.url)"
+FUNCTION_URL=$(gcloud functions describe $FUNCTION_NAME --region=$REGION --gen2 --format="value(serviceConfig.uri)")
+echo $FUNCTION_URL
 
 # Verify the deployment
 echo ""
 echo -e "${YELLOW}🔍 Verifying deployment...${NC}"
-FUNCTION_STATUS=$(gcloud functions describe $FUNCTION_NAME --region=$REGION --format="value(status)")
-echo "Function status: $FUNCTION_STATUS"
+FUNCTION_STATE=$(gcloud functions describe $FUNCTION_NAME --region=$REGION --gen2 --format="value(state)")
+echo "Function state: $FUNCTION_STATE"
 
 # Show recent logs
 echo ""
@@ -174,6 +175,10 @@ rm -f .gcloudignore 2>/dev/null
 
 echo ""
 echo -e "${GREEN}✅ Deployment script completed!${NC}"
+echo ""
+echo -e "${CYAN}API Endpoints:${NC}"
+echo "  POST ${FUNCTION_URL}/process-video - Start video processing"
+echo "  GET  ${FUNCTION_URL}/video-paths/{job_id} - Get video paths"
 
 # Security reminder
 echo ""

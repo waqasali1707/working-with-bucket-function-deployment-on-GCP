@@ -5,14 +5,17 @@ import requests
 import json
 from google.cloud import storage
 import openai
-from flask import jsonify
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 import logging
 import time
+import uuid
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # Logging configuration
 # -----------------------------------------------------------------------------
-
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -30,6 +33,44 @@ BUCKET_NAME = os.environ.get('BUCKET_NAME', 'postscrypt')
 
 # Configure OpenAI
 openai.api_key = OPENAI_API_KEY
+
+# Initialize FastAPI app
+app = FastAPI(title="Video Processing API", version="2.0.0")
+
+# Store processing jobs status
+processing_jobs = {}
+
+# -----------------------------------------------------------------------------
+# Pydantic models for request/response
+# -----------------------------------------------------------------------------
+
+class VideoProcessingRequest(BaseModel):
+    bucket_name: str
+    video_path: str  # e.g., "3/video1.mp4"
+    signed_url: str  # For Deepgram direct transcription
+    target_phrase: str = "I quite enjoyed under the dome."
+    num_chunks: Optional[int] = None
+    job_id: Optional[str] = None  # If not provided, will be generated
+
+class VideoProcessingResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+class VideoPathsRequest(BaseModel):
+    job_id: str
+
+class VideoPathsResponse(BaseModel):
+    job_id: str
+    status: str
+    public_video_path: Optional[str] = None
+    private_video_path: Optional[str] = None
+    error: Optional[str] = None
+    processing_details: Optional[Dict[str, Any]] = None
+
+# -----------------------------------------------------------------------------
+# Helper functions (keeping most of the original functions)
+# -----------------------------------------------------------------------------
 
 def download_video_from_url(signed_url, temp_video_path):
     """Download video from signed URL to temporary file"""
@@ -110,76 +151,23 @@ def extract_audio_cloud(video_path, output_audio_path):
         logger.error(f"FFmpeg error: {e.stderr}")
         return False
 
-def extract_audio_partial(video_path, output_audio_path, start_time=None, duration=None):
-    """Extract audio from a specific portion of video"""
-    command = ["ffmpeg", "-y"]
-    
-    # Add start time if specified
-    if start_time:
-        command.extend(["-ss", str(start_time)])
-    
-    command.extend(["-i", video_path])
-    
-    # Add duration if specified
-    if duration:
-        command.extend(["-t", str(duration)])
-    
-    command.extend([
-        "-vn",
-        "-acodec", "pcm_s16le", 
-        "-ar", "16000", 
-        "-ac", "1",
-        output_audio_path
-    ])
+def transcribe_with_deepgram_url(signed_url, model="nova-3"):
+    """Transcribe audio directly from URL using Deepgram API"""
+    logger.info(f"Transcribing audio directly from URL with Deepgram {model} model...")
     
     try:
-        logger.info(f"Extracting audio (start: {start_time}, duration: {duration})...")
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        logger.info("Audio extraction successful")
-        
-        # Check audio file size
-        audio_size = os.path.getsize(output_audio_path)
-        logger.info(f"Extracted audio size: {audio_size / (1024*1024):.2f} MB")
-        
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg error: {e.stderr}")
-        return False
-
-def transcribe_with_deepgram_cloud(audio_path, model="nova-2"):
-    """Transcribe audio using Deepgram API"""
-    if not os.path.isfile(audio_path):
-        logger.error(f"Audio file not found: {audio_path}")
-        return None
-    
-    # Log audio file size
-    audio_size = os.path.getsize(audio_path)
-    logger.info(f"Audio file size for transcription: {audio_size / (1024*1024):.2f} MB")
-    
-    # Check if audio file is very large
-    if audio_size > 100 * 1024 * 1024:  # 100MB
-        logger.warning(f"Audio file is very large ({audio_size / (1024*1024):.2f} MB), this may cause issues")
-    
-    # Use nova-3 model like in local version
-    model = "nova-3"
-    logger.info(f"Transcribing audio with Deepgram {model} model...")
-    
-    # For Cloud Functions, we might need to use streaming for large files
-    if audio_size > 10 * 1024 * 1024:  # If larger than 10MB
-        logger.info("Using chunked upload for large audio file")
-        return transcribe_large_audio_deepgram(audio_path, model)
-    
-    try:
-        with open(audio_path, 'rb') as audio_file:
-            response = requests.post(
-                f'https://api.deepgram.com/v1/listen?diarize=true&punctuate=true&utterances=true&model={model}',
-                headers={
-                    'Authorization': f'Token {DEEPGRAM_API_KEY}',
-                    'Content-Type': 'audio/wav'
-                },
-                data=audio_file,
-                timeout=1200  # 20 minute timeout
-            )
+        # Deepgram can transcribe directly from URL
+        response = requests.post(
+            f'https://api.deepgram.com/v1/listen?diarize=true&punctuate=true&utterances=true&model={model}',
+            headers={
+                'Authorization': f'Token {DEEPGRAM_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'url': signed_url
+            },
+            timeout=1200  # 20 minute timeout
+        )
         
         logger.info(f"Deepgram response status: {response.status_code}")
         
@@ -208,47 +196,6 @@ def transcribe_with_deepgram_cloud(audio_path, model="nova-2"):
         return None
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
-        return None
-
-def transcribe_large_audio_deepgram(audio_path, model="nova-3"):
-    """Transcribe large audio files using streaming"""
-    logger.info("Using streaming approach for large audio file")
-    
-    try:
-        # Get file size
-        file_size = os.path.getsize(audio_path)
-        
-        with open(audio_path, 'rb') as audio_file:
-            # Use streaming to avoid loading entire file into memory
-            headers = {
-                'Authorization': f'Token {DEEPGRAM_API_KEY}',
-                'Content-Type': 'audio/wav',
-            }
-            
-            # Create a generator to stream the file
-            def file_generator(file_obj, chunk_size=1024*1024):  # 1MB chunks
-                while True:
-                    chunk = file_obj.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-            
-            response = requests.post(
-                f'https://api.deepgram.com/v1/listen?diarize=true&punctuate=true&utterances=true&model={model}',
-                headers=headers,
-                data=file_generator(audio_file),
-                timeout=1800  # 30 minute timeout
-            )
-        
-        if response.status_code == 200:
-            logger.info("Large file transcription completed successfully")
-            return response.json()
-        else:
-            logger.error(f"Deepgram API error for large file: {response.status_code} - {response.text}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error during large file transcription: {e}")
         return None
 
 def split_transcription_into_chunks(utterances, num_chunks):
@@ -646,39 +593,17 @@ def download_video_from_gcs(bucket_name, source_blob_name, temp_video_path):
         logger.error(f"Error downloading video from GCS: {e}")
         return False
 
-def process_video_cloud(request):
-    """Main Cloud Function entry point"""
-    logger.info("=== DEPLOYMENT VERSION: 2024-01-17 with debug logging and fallback ===")  # Updated version marker
+def process_video_task(job_id: str, request: VideoProcessingRequest):
+    """Background task to process video"""
+    logger.info(f"=== STARTING VIDEO PROCESSING FOR JOB {job_id} ===")
     
     try:
-        # Parse request
-        request_json = request.get_json(silent=True)
-        if not request_json:
-            logger.error("No JSON payload provided")
-            return jsonify({'error': 'No JSON payload provided'}), 400
-        
-        # Accept either signed_url OR bucket/blob parameters
-        signed_url = request_json.get('signed_url')
-        source_bucket = request_json.get('source_bucket', BUCKET_NAME)
-        source_blob = request_json.get('source_blob')
-        
-        target_phrase = request_json.get('target_phrase', 'I quite enjoyed under the dome.')
-        original_folder = request_json.get('original_folder', '3')
-        num_chunks = request_json.get('num_chunks', None)  # Optional chunking parameter
-        
-        # Use the same bucket for output, just different paths within it
-        output_bucket = request_json.get('output_bucket', BUCKET_NAME)
-        
-        logger.info(f"=== STARTING VIDEO PROCESSING ===")
-        logger.info(f"Target phrase: '{target_phrase}'")
-        logger.info(f"Source bucket: {source_bucket}")
-        logger.info(f"Source blob: {source_blob}")
-        logger.info(f"Output bucket: {output_bucket}")
-        logger.info(f"Chunking: {'Enabled (' + str(num_chunks) + ' chunks)' if num_chunks else 'Disabled'}")
-        
-        if not signed_url and not source_blob:
-            logger.error("Either 'signed_url' or 'source_blob' is required")
-            return jsonify({'error': 'Either signed_url or source_blob is required'}), 400
+        # Update job status
+        processing_jobs[job_id] = {
+            "status": "processing",
+            "started_at": datetime.utcnow().isoformat(),
+            "request": request.dict()
+        }
         
         # Create temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -686,39 +611,23 @@ def process_video_cloud(request):
             
             # Define temporary file paths
             temp_video_path = os.path.join(temp_dir, 'input_video.mp4')
-            temp_audio_path = os.path.join(temp_dir, 'extracted_audio.wav')
             temp_part1_path = os.path.join(temp_dir, 'part1.mp4')
             temp_part2_path = os.path.join(temp_dir, 'part2.mp4')
             
-            # Step 1: Download video
-            logger.info("=== STEP 1: DOWNLOADING VIDEO ===")
-            if source_blob:
-                # Use direct GCS download (more efficient)
-                if not download_video_from_gcs(source_bucket, source_blob, temp_video_path):
-                    logger.error("Failed to download video from GCS")
-                    return jsonify({'error': 'Failed to download video from GCS'}), 500
-            else:
-                # Use signed URL download (fallback)
-                if not download_video_from_url(signed_url, temp_video_path):
-                    logger.error("Failed to download video from signed URL")
-                    return jsonify({'error': 'Failed to download video'}), 500
+            # Step 1: Download video from GCS for splitting
+            logger.info("=== STEP 1: DOWNLOADING VIDEO FOR SPLITTING ===")
+            if not download_video_from_gcs(request.bucket_name, request.video_path, temp_video_path):
+                raise Exception("Failed to download video from GCS")
             
             # Log video file size
             video_size = os.path.getsize(temp_video_path)
             logger.info(f"Video file size: {video_size / (1024*1024):.2f} MB")
             
-            # Step 2: Extract audio
-            logger.info("=== STEP 2: EXTRACTING AUDIO ===")
-            if not extract_audio_cloud(temp_video_path, temp_audio_path):
-                logger.error("Failed to extract audio")
-                return jsonify({'error': 'Failed to extract audio'}), 500
-            
-            # Step 3: Transcribe audio
-            logger.info("=== STEP 3: TRANSCRIBING AUDIO ===")
-            transcription_result = transcribe_with_deepgram_cloud(temp_audio_path)
+            # Step 2: Transcribe using Deepgram with signed URL
+            logger.info("=== STEP 2: TRANSCRIBING AUDIO WITH DEEPGRAM (USING URL) ===")
+            transcription_result = transcribe_with_deepgram_url(request.signed_url)
             if not transcription_result:
-                logger.error("Failed to transcribe audio")
-                return jsonify({'error': 'Failed to transcribe audio'}), 500
+                raise Exception("Failed to transcribe audio")
             
             # Log complete transcript for debugging
             utterances = transcription_result.get("results", {}).get("utterances", [])
@@ -731,74 +640,221 @@ def process_video_cloud(request):
             else:
                 logger.warning("No utterances found in transcription result")
             
-            # Step 4: Find timestamp with GPT-4
-            logger.info("=== STEP 4: FINDING PHRASE TIMESTAMP ===")
-            timestamp = find_phrase_timestamp_with_gpt4(transcription_result, target_phrase, num_chunks)
+            # Step 3: Find timestamp with GPT-4
+            logger.info("=== STEP 3: FINDING PHRASE TIMESTAMP ===")
+            timestamp = find_phrase_timestamp_with_gpt4(transcription_result, request.target_phrase, request.num_chunks)
             if not timestamp:
-                logger.error(f"I Could not find phrase: {target_phrase}")
-                # Return detailed error with transcript preview for debugging
-                transcript_preview = ""
-                full_transcript = ""
-                if utterances:
-                    # Show first 10 utterances instead of 5
-                    transcript_preview = " | ".join([u['transcript'] for u in utterances[:10]])
-                    # Also create a full transcript for logging
-                    full_transcript = " ".join([u['transcript'] for u in utterances])
-                    # Log the full transcript to help debug
-                    logger.error(f"Full transcript (first 1000 chars): {full_transcript[:1000]}")
-                
-                return jsonify({
-                    'error': f'I Could not find phrase: {target_phrase}',
-                    'transcript_preview': transcript_preview,
-                    'total_utterances': len(utterances),
-                    'transcript_snippet': full_transcript[:500]  # Add more context
-                }), 500
+                raise Exception(f"Could not find phrase: {request.target_phrase}")
             
             logger.info(f"Found timestamp: {timestamp}")
             
-            # Step 5: Split video
-            logger.info("=== STEP 5: SPLITTING VIDEO ===")
+            # Step 4: Split video
+            logger.info("=== STEP 4: SPLITTING VIDEO ===")
             if not split_video_at_timestamp(temp_video_path, timestamp, temp_part1_path, temp_part2_path):
-                logger.error("Failed to split video")
-                return jsonify({'error': 'Failed to split video'}), 500
+                raise Exception("Failed to split video")
             
-            # Step 6: Upload both parts to the SAME bucket in different folders
-            logger.info("=== STEP 6: UPLOADING SPLIT VIDEOS ===")
+            # Step 5: Upload both parts to designated folders
+            logger.info("=== STEP 5: UPLOADING SPLIT VIDEOS ===")
             
-            # Generate unique filenames with timestamp
-            timestamp_suffix = str(int(time.time()))
+            # Extract folder and filename from video path
+            # e.g., "3/video1.mp4" -> folder="3", filename="video1.mp4"
+            path_parts = request.video_path.split('/')
+            if len(path_parts) >= 2:
+                folder = path_parts[0]
+                filename = path_parts[-1]
+            else:
+                folder = ""
+                filename = request.video_path
             
-            # Use the original folder structure but within the same bucket
-            part1_destination = f"{original_folder}/split_results/part1_{timestamp_suffix}.mp4"
-            part2_destination = f"{original_folder}/split_results/part2_{timestamp_suffix}.mp4"
+            # Create paths according to new structure
+            public_destination = f"{folder}/public/{filename}" if folder else f"public/{filename}"
+            private_destination = f"{folder}/private/{filename}" if folder else f"private/{filename}"
             
-            logger.info(f"Uploading part 1 to: {part1_destination}")
-            upload_success_1 = upload_to_bucket(temp_part1_path, output_bucket, part1_destination)
+            logger.info(f"Uploading public part to: {public_destination}")
+            upload_success_1 = upload_to_bucket(temp_part1_path, request.bucket_name, public_destination)
             
-            logger.info(f"Uploading part 2 to: {part2_destination}")
-            upload_success_2 = upload_to_bucket(temp_part2_path, output_bucket, part2_destination)
+            logger.info(f"Uploading private part to: {private_destination}")
+            upload_success_2 = upload_to_bucket(temp_part2_path, request.bucket_name, private_destination)
             
             if not (upload_success_1 and upload_success_2):
-                logger.error("Failed to upload split videos")
-                return jsonify({'error': 'Failed to upload split videos'}), 500
+                raise Exception("Failed to upload split videos")
             
-            logger.info("=== VIDEO PROCESSING COMPLETED SUCCESSFULLY ===")
+            logger.info(f"=== VIDEO PROCESSING COMPLETED SUCCESSFULLY FOR JOB {job_id} ===")
             
-            # Return success response
-            return jsonify({
-                'success': True,
-                'message': 'Video processed successfully',
-                'timestamp_found': timestamp,
-                'target_phrase': target_phrase,
-                'part1_location': f"gs://{output_bucket}/{part1_destination}",
-                'part2_location': f"gs://{output_bucket}/{part2_destination}",
-                'bucket': output_bucket,
-                'processing_details': {
-                    'utterances_found': len(utterances),
-                    'transcript_preview': " | ".join([u['transcript'] for u in utterances[:3]]) if utterances else "No utterances"
+            # Update job status with success
+            processing_jobs[job_id] = {
+                "status": "completed",
+                "completed_at": datetime.utcnow().isoformat(),
+                "public_video_path": f"gs://{request.bucket_name}/{public_destination}",
+                "private_video_path": f"gs://{request.bucket_name}/{private_destination}",
+                "timestamp_found": timestamp,
+                "processing_details": {
+                    "utterances_found": len(utterances),
+                    "transcript_preview": " | ".join([u['transcript'] for u in utterances[:3]]) if utterances else "No utterances"
                 }
-            }), 200
+            }
     
     except Exception as e:
-        logger.error(f"Unexpected error in process_video_cloud: {e}", exc_info=True)
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+        logger.error(f"Error processing video for job {job_id}: {e}", exc_info=True)
+        processing_jobs[job_id] = {
+            "status": "failed",
+            "error": str(e),
+            "failed_at": datetime.utcnow().isoformat()
+        }
+
+# -----------------------------------------------------------------------------
+# FastAPI endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Video Processing API",
+        "version": "2.0.0",
+        "endpoints": {
+            "POST /process-video": "Start video processing job",
+            "GET /video-paths/{job_id}": "Get processed video paths"
+        }
+    }
+
+@app.post("/process-video", response_model=VideoProcessingResponse)
+async def process_video(request: VideoProcessingRequest, background_tasks: BackgroundTasks):
+    """Start video processing job"""
+    logger.info("=== RECEIVED VIDEO PROCESSING REQUEST ===")
+    
+    # Generate job ID if not provided
+    job_id = request.job_id or str(uuid.uuid4())
+    
+    # Validate request
+    if not request.bucket_name or not request.video_path or not request.signed_url:
+        raise HTTPException(status_code=400, detail="Missing required fields: bucket_name, video_path, or signed_url")
+    
+    # Check if job already exists
+    if job_id in processing_jobs:
+        raise HTTPException(status_code=409, detail=f"Job {job_id} already exists")
+    
+    # Start processing in background
+    background_tasks.add_task(process_video_task, job_id, request)
+    
+    # Return immediate response
+    return VideoProcessingResponse(
+        job_id=job_id,
+        status="accepted",
+        message="Video processing job started"
+    )
+
+@app.get("/video-paths/{job_id}", response_model=VideoPathsResponse)
+async def get_video_paths(job_id: str):
+    """Get processed video paths by job ID"""
+    
+    if job_id not in processing_jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job_info = processing_jobs[job_id]
+    
+    if job_info["status"] == "processing":
+        return VideoPathsResponse(
+            job_id=job_id,
+            status="processing",
+            error=None,
+            public_video_path=None,
+            private_video_path=None
+        )
+    elif job_info["status"] == "completed":
+        return VideoPathsResponse(
+            job_id=job_id,
+            status="completed",
+            public_video_path=job_info["public_video_path"],
+            private_video_path=job_info["private_video_path"],
+            processing_details=job_info.get("processing_details")
+        )
+    else:  # failed
+        return VideoPathsResponse(
+            job_id=job_id,
+            status="failed",
+            error=job_info.get("error", "Unknown error"),
+            public_video_path=None,
+            private_video_path=None
+        )
+
+# For Google Cloud Functions Gen2 compatibility
+import functions_framework
+from flask import Request, Response
+import asyncio
+from typing import Any
+
+# Create a wrapper function that Cloud Functions can call
+@functions_framework.http
+def main(request: Request) -> Response:
+    """HTTP Cloud Function entry point for FastAPI app."""
+    import nest_asyncio
+    nest_asyncio.apply()
+    
+    # Get the request data
+    path = request.path
+    method = request.method
+    headers = dict(request.headers)
+    body = request.get_data(as_text=True)
+    query_params = dict(request.args)
+    
+    # Create a mock ASGI scope
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "path": path,
+        "query_string": request.query_string or b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "server": ("localhost", 8080),
+        "scheme": "https",
+        "root_path": "",
+    }
+    
+    # Storage for response
+    response_data = {"status": 200, "headers": [], "body": b""}
+    
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": body.encode() if body else b"",
+        }
+    
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_data["status"] = message["status"]
+            response_data["headers"] = message.get("headers", [])
+        elif message["type"] == "http.response.body":
+            body_part = message.get("body", b"")
+            if body_part:
+                response_data["body"] += body_part
+    
+    # Run the FastAPI app
+    async def run_app():
+        await app(scope, receive, send)
+    
+    # Execute the async function
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_app())
+    finally:
+        loop.close()
+    
+    # Build Flask response
+    response = Response(response_data["body"])
+    response.status_code = response_data["status"]
+    
+    # Set headers
+    for header_name, header_value in response_data["headers"]:
+        if header_name.lower() != b"content-length":  # Flask sets this automatically
+            response.headers[header_name.decode()] = header_value.decode()
+    
+    return response
+
+# Also keep the original for local development
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)

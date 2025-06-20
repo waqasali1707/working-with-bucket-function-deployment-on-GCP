@@ -1,186 +1,214 @@
 import requests
 import json
 import os
+import time
 
-# Replace with your actual Cloud Function URL after deployment
-CLOUD_FUNCTION_URL = os.getenv('CLOUD_FUNCTION_URL', 'https://example.com/default-url')
+# Replace with your actual Cloud Run URL after deployment
+SERVICE_URL = os.getenv('SERVICE_URL', 'https://example.com/default-url')
 
-def test_video_processing_with_gcs():
-    """Test the video processing Cloud Function using direct GCS access"""
+def test_video_processing_api():
+    """Test the video processing FastAPI endpoints"""
     
+    # Step 1: Submit video processing job
     payload = {
-        # Use direct GCS access instead of signed URL (more efficient)
-        "source_bucket": "postscrypt",
-        "source_blob": "3/video1.mp4",
+        "bucket_name": "postscrypt",
+        "video_path": "3/video1.mp4",
+        "signed_url": os.getenv('SIGNED_URL', 'https://example.com/signed-url'),
         "target_phrase": "I quite enjoyed under the dome.",
-        "original_folder": "3",
-        "output_bucket": "postscrypt",  # Use same bucket for output
-        "num_chunks": 5  # NEW: Split transcription into 5 chunks for processing
+        "num_chunks": 5  # Split transcription into 5 chunks for processing
     }
     
-    print("Testing video processing function with GCS direct access...")
-    print(f"Source: gs://{payload['source_bucket']}/{payload['source_blob']}")
+    print("=== Testing Video Processing API ===")
+    print(f"Service URL: {SERVICE_URL}")
+    print(f"Video path: {payload['video_path']}")
     print(f"Target phrase: {payload['target_phrase']}")
     print(f"Chunking: {payload['num_chunks']} chunks")
-    print("Sending request to Cloud Function...")
+    print("\nStep 1: Submitting video processing job...")
     
     try:
+        # Submit job
         response = requests.post(
-            CLOUD_FUNCTION_URL,
+            f"{SERVICE_URL}/process-video",
             json=payload,
-            timeout=600  # 10 minute timeout
+            timeout=30
         )
         
         print(f"Response status: {response.status_code}")
         
-        if response.status_code == 200:
-            result = response.json()
-            print("✅ SUCCESS!")
-            print(f"Timestamp found: {result.get('timestamp_found')}")
-            print(f"Part 1 saved to: {result.get('part1_location')}")
-            print(f"Part 2 saved to: {result.get('part2_location')}")
-            print(f"Processing details: {result.get('processing_details', {})}")
-        else:
-            print("❌ ERROR!")
-            try:
-                error_data = response.json()
-                print(f"Error: {error_data.get('error', 'Unknown error')}")
+        if response.status_code != 200:
+            print("❌ ERROR submitting job!")
+            print(f"Response: {response.text}")
+            return
+        
+        result = response.json()
+        job_id = result.get('job_id')
+        print(f"✅ Job submitted successfully!")
+        print(f"Job ID: {job_id}")
+        print(f"Status: {result.get('status')}")
+        print(f"Message: {result.get('message')}")
+        
+        # Step 2: Poll for results
+        print("\nStep 2: Checking job status...")
+        max_attempts = 60  # Max 10 minutes
+        attempt = 0
+        
+        while attempt < max_attempts:
+            attempt += 1
+            time.sleep(10)  # Wait 10 seconds between checks
+            
+            print(f"\nAttempt {attempt}/{max_attempts}: Checking status...")
+            
+            status_response = requests.get(
+                f"{SERVICE_URL}/video-paths/{job_id}",
+                timeout=30
+            )
+            
+            if status_response.status_code != 200:
+                print(f"❌ ERROR checking status: {status_response.status_code}")
+                print(f"Response: {status_response.text}")
+                continue
+            
+            status_data = status_response.json()
+            status = status_data.get('status')
+            
+            print(f"Job status: {status}")
+            
+            if status == 'completed':
+                print("\n✅ VIDEO PROCESSING COMPLETED!")
+                print(f"Public video path: {status_data.get('public_video_path')}")
+                print(f"Private video path: {status_data.get('private_video_path')}")
                 
-                # Show transcript preview if available for debugging
-                if 'transcript_preview' in error_data:
-                    print(f"Transcript preview: {error_data['transcript_preview']}")
-                if 'total_utterances' in error_data:
-                    print(f"Total utterances found: {error_data['total_utterances']}")
-                    
-            except json.JSONDecodeError:
-                print(f"Raw error response: {response.text}")
+                if status_data.get('processing_details'):
+                    print(f"Processing details: {json.dumps(status_data['processing_details'], indent=2)}")
+                break
+                
+            elif status == 'failed':
+                print("\n❌ VIDEO PROCESSING FAILED!")
+                print(f"Error: {status_data.get('error')}")
+                break
+                
+            elif status == 'processing':
+                print("Still processing...")
+            else:
+                print(f"Unknown status: {status}")
+        
+        if attempt >= max_attempts:
+            print("\n❌ TIMEOUT: Job did not complete within 10 minutes")
             
     except requests.exceptions.Timeout:
-        print("❌ Request timed out. Video processing may still be running.")
-        print("Check Cloud Function logs for more details.")
+        print("❌ Request timed out")
     except Exception as e:
         print(f"❌ Error: {e}")
 
-def test_video_processing_with_signed_url():
-    """Test the video processing Cloud Function using signed URL (fallback method)"""
+def test_with_custom_job_id():
+    """Test with a custom job ID"""
     
-    # Your signed URL (keep this as fallback)
-    SIGNED_URL = os.getenv('SIGNED_URL', 'https://example.com/default-signed-url')
+    custom_job_id = f"test-job-{int(time.time())}"
     
     payload = {
-        "signed_url": SIGNED_URL,
+        "bucket_name": "postscrypt",
+        "video_path": "3/video1.mp4",
+        "signed_url": os.getenv('SIGNED_URL', 'https://example.com/signed-url'),
         "target_phrase": "I quite enjoyed under the dome.",
-        "original_folder": "3",
-        "output_bucket": "postscrypt",
-        "num_chunks": 3  # NEW: Split transcription into 3 chunks for processing
+        "num_chunks": 3,
+        "job_id": custom_job_id
     }
     
-    print("Testing video processing function with signed URL...")
-    print(f"Target phrase: {payload['target_phrase']}")
-    print(f"Chunking: {payload['num_chunks']} chunks")
-    print("Sending request to Cloud Function...")
+    print(f"=== Testing with custom job ID: {custom_job_id} ===")
+    print("Submitting job...")
     
     try:
         response = requests.post(
-            CLOUD_FUNCTION_URL,
+            f"{SERVICE_URL}/process-video",
             json=payload,
-            timeout=600  # 10 minute timeout
+            timeout=30
         )
         
-        print(f"Response status: {response.status_code}")
-        
         if response.status_code == 200:
-            result = response.json()
-            print("✅ SUCCESS!")
-            print(f"Timestamp found: {result.get('timestamp_found')}")
-            print(f"Part 1 saved to: {result.get('part1_location')}")
-            print(f"Part 2 saved to: {result.get('part2_location')}")
-        else:
-            print("❌ ERROR!")
-            try:
-                error_data = response.json()
-                print(f"Error: {error_data.get('error', 'Unknown error')}")
-                
-                # Show transcript preview if available for debugging
-                if 'transcript_preview' in error_data:
-                    print(f"Transcript preview: {error_data['transcript_preview']}")
-                if 'total_utterances' in error_data:
-                    print(f"Total utterances found: {error_data['total_utterances']}")
-                    
-            except json.JSONDecodeError:
-                print(f"Raw error response: {response.text}")
+            print("✅ Job submitted successfully!")
+            print(f"Response: {response.json()}")
             
-    except requests.exceptions.Timeout:
-        print("❌ Request timed out. Video processing may still be running.")
+            # You can now check status using the custom job ID
+            print(f"\nTo check status, use: GET {SERVICE_URL}/video-paths/{custom_job_id}")
+        else:
+            print(f"❌ Error: {response.status_code}")
+            print(f"Response: {response.text}")
+            
     except Exception as e:
         print(f"❌ Error: {e}")
 
-def test_without_chunking():
-    """Test the video processing without chunking (original behavior)"""
+def test_invalid_job_id():
+    """Test getting paths for non-existent job"""
     
-    payload = {
-        "source_bucket": "postscrypt",
-        "source_blob": "3/video1.mp4",
-        "target_phrase": "I quite enjoyed under the dome.",
-        "original_folder": "3",
-        "output_bucket": "postscrypt"
-        # No num_chunks parameter = no chunking (original behavior)
-    }
+    fake_job_id = "non-existent-job-id"
     
-    print("Testing video processing function WITHOUT chunking (original behavior)...")
-    print(f"Source: gs://{payload['source_bucket']}/{payload['source_blob']}")
-    print(f"Target phrase: {payload['target_phrase']}")
-    print("Chunking: Disabled")
-    print("Sending request to Cloud Function...")
+    print(f"=== Testing with invalid job ID: {fake_job_id} ===")
     
     try:
-        response = requests.post(
-            CLOUD_FUNCTION_URL,
-            json=payload,
-            timeout=600  # 10 minute timeout
+        response = requests.get(
+            f"{SERVICE_URL}/video-paths/{fake_job_id}",
+            timeout=30
+        )
+        
+        print(f"Response status: {response.status_code}")
+        print(f"Response: {response.text}")
+        
+        if response.status_code == 404:
+            print("✅ Correctly returned 404 for non-existent job")
+        else:
+            print("❌ Unexpected response code")
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+def test_api_root():
+    """Test the root endpoint"""
+    
+    print("=== Testing API root endpoint ===")
+    
+    try:
+        response = requests.get(
+            SERVICE_URL,
+            timeout=30
         )
         
         print(f"Response status: {response.status_code}")
         
         if response.status_code == 200:
-            result = response.json()
-            print("✅ SUCCESS!")
-            print(f"Timestamp found: {result.get('timestamp_found')}")
-            print(f"Part 1 saved to: {result.get('part1_location')}")
-            print(f"Part 2 saved to: {result.get('part2_location')}")
-            print(f"Processing details: {result.get('processing_details', {})}")
+            print("✅ API is running!")
+            print(f"Response: {json.dumps(response.json(), indent=2)}")
         else:
-            print("❌ ERROR!")
-            try:
-                error_data = response.json()
-                print(f"Error: {error_data.get('error', 'Unknown error')}")
-                
-                # Show transcript preview if available for debugging
-                if 'transcript_preview' in error_data:
-                    print(f"Transcript preview: {error_data['transcript_preview']}")
-                if 'total_utterances' in error_data:
-                    print(f"Total utterances found: {error_data['total_utterances']}")
-                    
-            except json.JSONDecodeError:
-                print(f"Raw error response: {response.text}")
+            print(f"❌ Unexpected response: {response.text}")
             
-    except requests.exceptions.Timeout:
-        print("❌ Request timed out. Video processing may still be running.")
-        print("Check Cloud Function logs for more details.")
     except Exception as e:
         print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
-    print("Choose test method:")
-    print("1. Direct GCS access with chunking (5 chunks)")
-    print("2. Signed URL with chunking (3 chunks)")
-    print("3. Without chunking (original behavior)")
+    print("FastAPI Video Processing Test Suite")
+    print("=" * 50)
     
-    choice = input("Enter choice (1, 2, or 3, default 1): ").strip()
+    print("\nChoose test:")
+    print("1. Full video processing test (submit job and wait for completion)")
+    print("2. Test with custom job ID")
+    print("3. Test invalid job ID handling")
+    print("4. Test API root endpoint")
+    print("5. Run all tests")
+    
+    choice = input("\nEnter choice (1-5, default 1): ").strip()
     
     if choice == "2":
-        test_video_processing_with_signed_url()
+        test_with_custom_job_id()
     elif choice == "3":
-        test_without_chunking()
+        test_invalid_job_id()
+    elif choice == "4":
+        test_api_root()
+    elif choice == "5":
+        test_api_root()
+        print("\n" + "=" * 50 + "\n")
+        test_video_processing_api()
+        print("\n" + "=" * 50 + "\n")
+        test_with_custom_job_id()
+        print("\n" + "=" * 50 + "\n")
+        test_invalid_job_id()
     else:
-        test_video_processing_with_gcs()
+        test_video_processing_api()
