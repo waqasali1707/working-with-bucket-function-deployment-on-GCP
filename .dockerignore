@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+testing_env/
+BT_env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Test and deployment files
+test_*.py
+deploy_*.sh
+*.ps1
+
+# Documentation
+*.md
+README*
+
+# Logs and debug files
+*.log
+
+# Other files
+.gcloudignore
+Dockerfile.backup 
